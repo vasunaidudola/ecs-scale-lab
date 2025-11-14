@@ -1,6 +1,4 @@
-mkdir ecs-labcd ecs-labnotepad taskdef.jsonPaste the code
- 
-{
+ {
   "family": "my-nginx-task",
   "networkMode": "awsvpc",
   "requiresCompatibilities": ["FARGATE"],
