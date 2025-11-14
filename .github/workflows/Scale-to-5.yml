@@ -1,0 +1,66 @@
+name: Scale ECS Service to 5 (no restart)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scale:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      CLUSTER: ${{ secrets.ECS_CLUSTER }}
+      SERVICE: ${{ secrets.ECS_SERVICE }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Show caller identity & region
+        run: |
+          echo "Caller:"
+          aws sts get-caller-identity
+          echo "Region: $AWS_REGION"
+
+      - name: Describe service BEFORE
+        run: |
+          echo "=== describe-services BEFORE ==="
+          aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --region "$AWS_REGION" --output table || true
+          echo "List tasks BEFORE:"
+          aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" --region "$AWS_REGION" --output text || true
+          # save detailed before JSON artifact
+          TASKS=$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" --region "$AWS_REGION" --query 'taskArns' --output text || echo "")
+          if [ -n "$TASKS" ]; then
+            aws ecs describe-tasks --cluster "$CLUSTER" --tasks $TASKS --region "$AWS_REGION" --output json > before_tasks.json || true
+          fi
+
+      - name: Update desired count to 5 (no force-new-deployment)
+        run: |
+          echo "Updating desired count to 5..."
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --desired-count 5 --region "$AWS_REGION"
+
+      - name: Wait short for tasks to start
+        run: |
+          echo "Sleeping 20s to allow new tasks to start..."
+          sleep 20
+
+      - name: Describe service AFTER & list tasks
+        run: |
+          echo "=== describe-services AFTER ==="
+          aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --region "$AWS_REGION" --output table || true
+          echo "List tasks AFTER:"
+          aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" --region "$AWS_REGION" --output text || true
+          TASKS=$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" --region "$AWS_REGION" --query 'taskArns' --output text || echo "")
+          if [ -n "$TASKS" ]; then
+            aws ecs describe-tasks --cluster "$CLUSTER" --tasks $TASKS --region "$AWS_REGION" --output json > after_tasks.json || true
+          fi
+
+      - name: Upload before/after artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ecs-tasks-artifacts
+          path: |
+            before_tasks.json
+            after_tasks.json
