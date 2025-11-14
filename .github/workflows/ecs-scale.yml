@@ -1,0 +1,43 @@
+name: Scale ECS Service to 5 Tasks
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scale-ecs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Show current ECS service
+        run: |
+          echo "Describe service before change:"
+          aws ecs describe-services --cluster "${{ secrets.ECS_CLUSTER }}" --services "${{ secrets.ECS_SERVICE }}" --region "${{ secrets.AWS_REGION }}" --output table || true
+
+      - name: Scale ECS Service to 5 tasks
+        run: |
+          echo "Updating desired count to 5..."
+          aws ecs update-service --cluster "${{ secrets.ECS_CLUSTER }}" --service "${{ secrets.ECS_SERVICE }}" --desired-count 5 --region "${{ secrets.AWS_REGION }}"
+
+      - name: Set AutoScaling Min Capacity to 5
+        run: |
+          echo "Registering scalable target (min=5 max=10)..."
+          aws application-autoscaling register-scalable-target \
+            --service-namespace ecs \
+            --resource-id service/${{ secrets.ECS_CLUSTER }}/${{ secrets.ECS_SERVICE }} \
+            --scalable-dimension ecs:service:DesiredCount \
+            --min-capacity 5 \
+            --max-capacity 10 \
+            --region "${{ secrets.AWS_REGION }}"
+
+      - name: Describe service after change
+        run: |
+          echo "Describe service after changes:"
+          aws ecs describe-services --cluster "${{ secrets.ECS_CLUSTER }}" --services "${{ secrets.ECS_SERVICE }}" --region "${{ secrets.AWS_REGION }}" --output table || true
+          echo "Describe scalable targets:"
+          aws application-autoscaling describe-scalable-targets --service-namespace ecs --resource-id service/${{ secrets.ECS_CLUSTER }}/${{ secrets.ECS_SERVICE }} --scalable-dimension ecs:service:DesiredCount --region "${{ secrets.AWS_REGION }}" --output table || true
