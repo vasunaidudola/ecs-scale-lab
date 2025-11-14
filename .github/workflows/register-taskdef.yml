@@ -1,0 +1,40 @@
+name: Step 2 - Register Task Definition from repo file
+
+on:
+  workflow_dispatch:
+
+jobs:
+  register-taskdef:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      TASKDEF_PATH: taskdef.json    # change if you put file in a subfolder like ecs/taskdef.json
+    steps:
+      - name: Checkout repo (so taskdef.json is available)
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Show caller identity & check file
+        run: |
+          echo "Caller identity:"
+          aws sts get-caller-identity
+          echo "Listing repo root files:"
+          ls -la
+          echo "Show taskdef head:"
+          head -n 50 $TASKDEF_PATH || true
+
+      - name: Register task definition from file
+        run: |
+          echo "Registering task definition using $TASKDEF_PATH ..."
+          aws ecs register-task-definition --cli-input-json file://$TASKDEF_PATH --region "$AWS_REGION"
+
+      - name: Verify registration
+        run: |
+          echo "Describe registered task definition (family=my-nginx-task):"
+          aws ecs describe-task-definition --task-definition my-nginx-task --region "$AWS_REGION" --output table || true
