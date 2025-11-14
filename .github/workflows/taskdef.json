@@ -1,0 +1,22 @@
+mkdir ecs-labcd ecs-labnotepad taskdef.jsonPaste the code
+ 
+{
+  "family": "my-nginx-task",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "containerDefinitions": [
+    {
+      "name": "my-nginx",
+      "image": "nginx:latest",
+      "portMappings": [
+        {
+          "containerPort": 80,
+          "protocol": "tcp"
+        }
+      ],
+      "essential": true
+    }
+  ]
+}
