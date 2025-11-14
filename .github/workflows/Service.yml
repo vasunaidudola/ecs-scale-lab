@@ -1,0 +1,52 @@
+name: Step 3 - Create ECS Service (create-if-missing)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  create-service:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      CLUSTER: ${{ secrets.ECS_CLUSTER }}
+      SERVICE: ${{ secrets.ECS_SERVICE }}
+      SUBNET1: ${{ secrets.SUBNET1 }}
+      SUBNET2: ${{ secrets.SUBNET2 }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Show caller identity & check prereqs
+        run: |
+          echo "Caller identity:"
+          aws sts get-caller-identity
+          echo "Check task definition exists:"
+          aws ecs describe-task-definition --task-definition my-nginx-task --region "$AWS_REGION" || (echo "taskdef missing" && exit 1)
+          echo "Cluster status:"
+          aws ecs describe-clusters --clusters "$CLUSTER" --region "$AWS_REGION" --query 'clusters[0].[clusterName,status]' --output table
+
+      - name: Create service if missing
+        run: |
+          set -e
+          echo "Checking if service exists..."
+          SVC_ARN=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --region "$AWS_REGION" --query 'services[0].serviceArn' --output text 2>/dev/null || echo "NONE")
+          if [ "$SVC_ARN" = "NONE" ] || [ "$SVC_ARN" = "None" ]; then
+            echo "Creating ECS service $SERVICE in cluster $CLUSTER (desiredCount=2)..."
+            aws ecs create-service \
+              --cluster "$CLUSTER" \
+              --service-name "$SERVICE" \
+              --task-definition my-nginx-task \
+              --desired-count 2 \
+              --launch-type FARGATE \
+              --network-configuration "awsvpcConfiguration={subnets=[$SUBNET1,$SUBNET2],assignPublicIp=ENABLED}" \
+              --region "$AWS_REGION"
+            echo "Service create command finished."
+          else
+            echo "Service already exists: $SVC_ARN"
+            echo "Current service summary:"
+            aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --region "$AWS_REGION" --output table
+          fi
