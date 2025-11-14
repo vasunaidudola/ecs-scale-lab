@@ -1,0 +1,32 @@
+name: Step 1 - Create ECS Cluster
+
+on:
+  workflow_dispatch:
+
+jobs:
+  create-cluster:
+    runs-on: ubuntu-latest
+    env:
+      CLUSTER: ${{ secrets.ECS_CLUSTER }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Show caller identity & region (safety)
+        run: |
+          echo "Caller identity (account & ARN):"
+          aws sts get-caller-identity
+          echo "Region used: $AWS_REGION"
+
+      - name: Create ECS cluster (idempotent)
+        run: |
+          echo "Creating ECS cluster: $CLUSTER"
+          # if cluster exists this call is idempotent and will return the existing cluster
+          aws ecs create-cluster --cluster-name "$CLUSTER" --region "$AWS_REGION"
+          echo "Describe cluster:"
+          aws ecs describe-clusters --clusters "$CLUSTER" --region "$AWS_REGION" --output table
