@@ -1,4 +1,4 @@
-name: "ECS Full Pipeline (create cluster, register taskdef, create service, scale, register scaling & force restart)"
+name: "ECS Full Pipeline — guaranteed restart via new taskdef revision"
 
 on:
   workflow_dispatch:
@@ -19,7 +19,7 @@ jobs:
       ASG_MAX: ${{ secrets.MAX_CAPACITY }}
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Configure AWS credentials
@@ -29,39 +29,45 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Create ECS Cluster (idempotent)
+      - name: Ensure ECS cluster exists
         run: |
           aws ecs create-cluster --cluster-name "$CLUSTER" --region "$AWS_REGION" || true
 
-      - name: Register task definition from repo
-        id: register
+      - name: Validate taskdef.json exists
         run: |
           if [ ! -f "$TASKDEF_PATH" ]; then
-            echo "ERROR: $TASKDEF_PATH not found"
+            echo "ERROR: $TASKDEF_PATH not found in repo root"
             exit 1
           fi
-          ARN=$(aws ecs register-task-definition --cli-input-json file://$TASKDEF_PATH --region "$AWS_REGION" --query 'taskDefinition.taskDefinitionArn' --output text)
-          echo "taskdef_arn=$ARN" >> $GITHUB_OUTPUT
+
+      - name: Register task definition (initial) and capture ARN
+        id: register_initial
+        run: |
+          ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://$TASKDEF_PATH \
+            --region "$AWS_REGION" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "taskdef_arn_initial=$ARN" >> $GITHUB_OUTPUT
 
       - name: Remove DRAINING service if present
         run: |
           STATUS=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --region "$AWS_REGION" --query 'services[0].status' --output text 2>/dev/null || echo "NONE")
-          echo "service status: $STATUS"
+          echo "Service status: $STATUS"
           if [ "$STATUS" = "DRAINING" ]; then
             aws ecs delete-service --cluster "$CLUSTER" --service "$SERVICE" --force --region "$AWS_REGION"
             sleep 5
           fi
 
-      - name: Create service if missing or update to registered taskdef
+      - name: Create service if missing (desiredCount = initial) or update
         run: |
-          ARN="${{ steps.register.outputs.taskdef_arn }}"
-          SVC=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --region "$AWS_REGION" --query 'services[0].serviceArn' --output text 2>/dev/null || echo "")
-          if [ -z "$SVC" ] || [ "$SVC" = "None" ]; then
+          ARN="${{ steps.register_initial.outputs.taskdef_arn_initial }}"
+          SVC_ARN=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --region "$AWS_REGION" --query 'services[0].serviceArn' --output text 2>/dev/null || echo "")
+          if [ -z "$SVC_ARN" ] || [ "$SVC_ARN" = "None" ]; then
             aws ecs create-service \
               --cluster "$CLUSTER" \
               --service-name "$SERVICE" \
               --task-definition "$ARN" \
-              --desired-count ${DESIRED_COUNT_INITIAL} \
+              --desired-count $DESIRED_COUNT_INITIAL \
               --launch-type FARGATE \
               --network-configuration "awsvpcConfiguration={subnets=[$SUBNET1,$SUBNET2],assignPublicIp=ENABLED}" \
               --region "$AWS_REGION"
@@ -70,13 +76,13 @@ jobs:
               --cluster "$CLUSTER" \
               --service "$SERVICE" \
               --task-definition "$ARN" \
-              --desired-count ${DESIRED_COUNT_INITIAL} \
+              --desired-count $DESIRED_COUNT_INITIAL \
               --region "$AWS_REGION"
           fi
 
-      - name: Scale service to desired count = 5
+      - name: Scale service to desiredCount = 5
         run: |
-          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --desired-count ${DESIRED_COUNT_SCALE} --region "$AWS_REGION"
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --desired-count $DESIRED_COUNT_SCALE --region "$AWS_REGION"
 
       - name: Register scalable target (min/max)
         run: |
@@ -89,10 +95,50 @@ jobs:
             --max-capacity ${MAX} \
             --region "$AWS_REGION"
 
-      - name: Force new deployment (restart tasks)
+      - name: Register new taskdef revision (inject timestamp) to force restart
+        id: register_restart
         run: |
-          aws ecs update-service \
-            --cluster "$CLUSTER" \
-            --service "$SERVICE" \
-            --force-new-deployment \
-            --region "$AWS_REGION"
+          RESTART_TS=$(date +%s)
+          # add RESTART_TS env var to first containerDefinitions entry (creates new revision)
+          jq --arg ts "$RESTART_TS" \
+            '.containerDefinitions[0].environment = (.containerDefinitions[0].environment // []) + [{"name":"RESTART_TS","value":$ts}]' \
+            "$TASKDEF_PATH" > /tmp/taskdef_restart.json
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/taskdef_restart.json \
+            --region "$AWS_REGION" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          if [ -z "$NEW_ARN" ] || [ "$NEW_ARN" = "None" ]; then
+            echo "ERROR: failed to register new task definition revision"
+            exit 1
+          fi
+          echo "taskdef_arn_for_restart=$NEW_ARN" >> $GITHUB_OUTPUT
+          echo "Registered new taskdef ARN: $NEW_ARN"
+
+      - name: Update service to new task definition (guaranteed rolling replacement)
+        run: |
+          NEW_ARN="${{ steps.register_restart.outputs.taskdef_arn_for_restart }}"
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --task-definition "$NEW_ARN" --region "$AWS_REGION"
+
+      - name: Wait until runningCount == desiredCount (timeout 10min)
+        run: |
+          DESIRED=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --region "$AWS_REGION" --query 'services[0].desiredCount' --output text)
+          echo "Waiting until runningCount == $DESIRED"
+          elapsed=0
+          while [ $elapsed -lt 600 ]; do
+            RUNNING=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --region "$AWS_REGION" --query 'services[0].runningCount' --output text)
+            echo "runningCount = $RUNNING"
+            if [ "$RUNNING" = "$DESIRED" ]; then
+              echo "Desired running count achieved."
+              exit 0
+            fi
+            sleep 10
+            elapsed=$((elapsed+10))
+          done
+          echo "Timeout waiting for runningCount to reach desiredCount."
+          aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --region "$AWS_REGION" --output json
+          exit 1
+
+      - name: Final describe & list tasks
+        run: |
+          aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --region "$AWS_REGION" --output table || true
+          aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" --region "$AWS_REGION" --output text || true
