@@ -1,0 +1,98 @@
+name: "ECS Full Pipeline (create cluster, register taskdef, create service, scale, register scaling & force restart)"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ecs-deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      CLUSTER: ${{ secrets.ECS_CLUSTER }}
+      SERVICE: ${{ secrets.ECS_SERVICE }}
+      TASKDEF_PATH: taskdef.json
+      SUBNET1: ${{ secrets.SUBNET1 }}
+      SUBNET2: ${{ secrets.SUBNET2 }}
+      DESIRED_COUNT_INITIAL: 2
+      DESIRED_COUNT_SCALE: 5
+      ASG_MIN: 5
+      ASG_MAX: ${{ secrets.MAX_CAPACITY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create ECS Cluster (idempotent)
+        run: |
+          aws ecs create-cluster --cluster-name "$CLUSTER" --region "$AWS_REGION" || true
+
+      - name: Register task definition from repo
+        id: register
+        run: |
+          if [ ! -f "$TASKDEF_PATH" ]; then
+            echo "ERROR: $TASKDEF_PATH not found"
+            exit 1
+          fi
+          ARN=$(aws ecs register-task-definition --cli-input-json file://$TASKDEF_PATH --region "$AWS_REGION" --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "taskdef_arn=$ARN" >> $GITHUB_OUTPUT
+
+      - name: Remove DRAINING service if present
+        run: |
+          STATUS=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --region "$AWS_REGION" --query 'services[0].status' --output text 2>/dev/null || echo "NONE")
+          echo "service status: $STATUS"
+          if [ "$STATUS" = "DRAINING" ]; then
+            aws ecs delete-service --cluster "$CLUSTER" --service "$SERVICE" --force --region "$AWS_REGION"
+            sleep 5
+          fi
+
+      - name: Create service if missing or update to registered taskdef
+        run: |
+          ARN="${{ steps.register.outputs.taskdef_arn }}"
+          SVC=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --region "$AWS_REGION" --query 'services[0].serviceArn' --output text 2>/dev/null || echo "")
+          if [ -z "$SVC" ] || [ "$SVC" = "None" ]; then
+            aws ecs create-service \
+              --cluster "$CLUSTER" \
+              --service-name "$SERVICE" \
+              --task-definition "$ARN" \
+              --desired-count ${DESIRED_COUNT_INITIAL} \
+              --launch-type FARGATE \
+              --network-configuration "awsvpcConfiguration={subnets=[$SUBNET1,$SUBNET2],assignPublicIp=ENABLED}" \
+              --region "$AWS_REGION"
+          else
+            aws ecs update-service \
+              --cluster "$CLUSTER" \
+              --service "$SERVICE" \
+              --task-definition "$ARN" \
+              --desired-count ${DESIRED_COUNT_INITIAL} \
+              --region "$AWS_REGION"
+          fi
+
+      - name: Scale service to desired count = 5
+        run: |
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --desired-count ${DESIRED_COUNT_SCALE} --region "$AWS_REGION"
+
+      - name: Register scalable target (min/max)
+        run: |
+          MAX=${ASG_MAX:-10}
+          aws application-autoscaling register-scalable-target \
+            --service-namespace ecs \
+            --resource-id "service/${CLUSTER}/${SERVICE}" \
+            --scalable-dimension ecs:service:DesiredCount \
+            --min-capacity ${ASG_MIN} \
+            --max-capacity ${MAX} \
+            --region "$AWS_REGION"
+
+      - name: Force new deployment (restart tasks)
+        run: |
+          aws ecs update-service \
+            --cluster "$CLUSTER" \
+            --service "$SERVICE" \
+            --force-new-deployment \
+            --region "$AWS_REGION"
