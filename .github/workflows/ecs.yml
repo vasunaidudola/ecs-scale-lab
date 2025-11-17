@@ -1,4 +1,4 @@
-name: "ECS full pipeline — minimal with force-new-deployment restart"
+name: "ECS full pipeline — create cluster, register taskdef, create service, scale, register scaling & guaranteed full restart"
 
 on:
   workflow_dispatch:
@@ -19,32 +19,38 @@ jobs:
       DESIRED_COUNT_SCALE: 5
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: aws-actions/configure-aws-credentials@v2
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Create ECS cluster
+      - name: Ensure ECS cluster exists
         run: |
           aws ecs create-cluster --cluster-name "$CLUSTER" --region "$AWS_REGION" || true
 
-      - name: Register taskdef revision #1
+      - name: Register task definition (initial) and capture ARN
         id: reg1
         run: |
-          TD=$(aws ecs register-task-definition \
+          ARN=$(aws ecs register-task-definition \
             --cli-input-json file://$TASKDEF_PATH \
             --query 'taskDefinition.taskDefinitionArn' \
             --output text --region "$AWS_REGION")
-          echo "arn=$TD" >> $GITHUB_OUTPUT
+          if [ -z "$ARN" ] || [ "$ARN" = "None" ]; then
+            echo "Failed to register initial task definition"
+            exit 1
+          fi
+          echo "taskdef_arn=$ARN" >> $GITHUB_OUTPUT
 
-      - name: Create service if missing (desiredCount=2)
+      - name: Create service if missing (use registered ARN, desiredCount=2)
         run: |
-          ARN="${{ steps.reg1.outputs.arn }}"
-          SVC=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --query 'services[0].serviceArn' --output text --region "$AWS_REGION" 2>/dev/null || echo "")
-          if [ -z "$SVC" ] || [ "$SVC" = "None" ]; then
+          ARN="${{ steps.reg1.outputs.taskdef_arn }}"
+          SVC_ARN=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --query 'services[0].serviceArn' --output text --region "$AWS_REGION" 2>/dev/null || echo "")
+          if [ -z "$SVC_ARN" ] || [ "$SVC_ARN" = "None" ]; then
             aws ecs create-service \
               --cluster "$CLUSTER" \
               --service-name "$SERVICE" \
@@ -61,7 +67,7 @@ jobs:
               --region "$AWS_REGION"
           fi
 
-      - name: Scale service to 5
+      - name: Scale service to desiredCount = 5
         run: |
           aws ecs update-service \
             --cluster "$CLUSTER" \
@@ -69,7 +75,7 @@ jobs:
             --desired-count $DESIRED_COUNT_SCALE \
             --region "$AWS_REGION"
 
-      - name: Register scalable target
+      - name: Register scalable target (min/max)
         run: |
           MAX=${ASG_MAX:-10}
           aws application-autoscaling register-scalable-target \
@@ -80,19 +86,24 @@ jobs:
             --max-capacity $MAX \
             --region "$AWS_REGION"
 
-      - name: Register taskdef revision #2 (optional if you want a new revision)
-        id: reg2
+      - name: Register new task definition revision (guarantee new revision)
+        id: reg_restart
         run: |
-          TD2=$(aws ecs register-task-definition \
+          NEW_ARN=$(aws ecs register-task-definition \
             --cli-input-json file://$TASKDEF_PATH \
             --query 'taskDefinition.taskDefinitionArn' \
             --output text --region "$AWS_REGION")
-          echo "arn=$TD2" >> $GITHUB_OUTPUT
+          if [ -z "$NEW_ARN" ] || [ "$NEW_ARN" = "None" ]; then
+            echo "Failed to register new task definition revision"
+            exit 1
+          fi
+          echo "taskdef_arn_for_restart=$NEW_ARN" >> $GITHUB_OUTPUT
 
-      - name: Restart using force-new-deployment
+      - name: Update service to new task definition ARN (forces full rolling replacement)
         run: |
+          NEW_ARN="${{ steps.reg_restart.outputs.taskdef_arn_for_restart }}"
           aws ecs update-service \
             --cluster "$CLUSTER" \
             --service "$SERVICE" \
-            --force-new-deployment \
+            --task-definition "$NEW_ARN" \
             --region "$AWS_REGION"
