@@ -1,4 +1,4 @@
-name: "ECS Full Pipeline — guaranteed restart via new taskdef revision"
+name: "ECS Full Pipeline — Safe Parallel Restart (Option A)"
 
 on:
   workflow_dispatch:
@@ -99,7 +99,6 @@ jobs:
         id: register_restart
         run: |
           RESTART_TS=$(date +%s)
-          # add RESTART_TS env var to first containerDefinitions entry (creates new revision)
           jq --arg ts "$RESTART_TS" \
             '.containerDefinitions[0].environment = (.containerDefinitions[0].environment // []) + [{"name":"RESTART_TS","value":$ts}]' \
             "$TASKDEF_PATH" > /tmp/taskdef_restart.json
@@ -114,10 +113,15 @@ jobs:
           echo "taskdef_arn_for_restart=$NEW_ARN" >> $GITHUB_OUTPUT
           echo "Registered new taskdef ARN: $NEW_ARN"
 
-      - name: Update service to new task definition (guaranteed rolling replacement)
+      - name: Update service to new task definition (relaxed deployment config for parallel replacement)
         run: |
           NEW_ARN="${{ steps.register_restart.outputs.taskdef_arn_for_restart }}"
-          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --task-definition "$NEW_ARN" --region "$AWS_REGION"
+          aws ecs update-service \
+            --cluster "$CLUSTER" \
+            --service "$SERVICE" \
+            --task-definition "$NEW_ARN" \
+            --deployment-configuration "maximumPercent=200,minimumHealthyPercent=50" \
+            --region "$AWS_REGION"
 
       - name: Wait until runningCount == desiredCount (timeout 10min)
         run: |
