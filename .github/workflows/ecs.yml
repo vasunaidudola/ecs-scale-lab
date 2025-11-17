@@ -20,40 +20,57 @@ jobs:
 
     steps:
 
-      # 1. Checkout
       - uses: actions/checkout@v4
 
-      # 2. AWS auth
       - uses: aws-actions/configure-aws-credentials@v2
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-
-      # 3. Create ECS cluster (idempotent)
       - name: Create ECS Cluster
         run: |
-          aws ecs create-cluster --cluster-name "$CLUSTER" --region "$AWS_REGION" || true
+          aws ecs create-cluster --cluster-name "$CLUSTER" || true
 
-
-      # 4. Register Task Definition (Main one)
       - name: Register Task Definition
         id: register
         run: |
           ARN=$(aws ecs register-task-definition \
             --cli-input-json file://$TASKDEF_PATH \
             --query 'taskDefinition.taskDefinitionArn' \
-            --output text --region "$AWS_REGION")
+            --output text)
           echo "taskdef_arn=$ARN" >> $GITHUB_OUTPUT
 
+      # 🔥 FIX: Delete DRAINING service before creating/updating
+      - name: Check and Remove Draining Service
+        run: |
+          STATUS=$(aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE" \
+            --query 'services[0].status' \
+            --output text 2>/dev/null || echo "NONE")
 
-      # 5. Create Service (or update existing one)
-      - name: Create or Update Service (desiredCount=2)
+          echo "Current service status: $STATUS"
+
+          if [ "$STATUS" = "DRAINING" ]; then
+            echo "Service is in DRAINING state. Deleting..."
+            aws ecs delete-service \
+              --cluster "$CLUSTER" \
+              --service "$SERVICE" \
+              --force
+            echo "Waiting 5 seconds..."
+            sleep 5
+          fi
+
+      - name: Create or Update Service
         run: |
           ARN="${{ steps.register.outputs.taskdef_arn }}"
-          SVC=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
-                --query 'services[0].serviceArn' --output text --region "$AWS_REGION" 2>/dev/null)
+
+          SVC=$(aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE" \
+            --query 'services[0].serviceArn' \
+            --output text 2>/dev/null)
 
           if [ "$SVC" = "None" ] || [ -z "$SVC" ]; then
             aws ecs create-service \
@@ -62,29 +79,22 @@ jobs:
               --task-definition "$ARN" \
               --desired-count $DESIRED_COUNT_INITIAL \
               --launch-type FARGATE \
-              --network-configuration "awsvpcConfiguration={subnets=[$SUBNET1,$SUBNET2],assignPublicIp=ENABLED}" \
-              --region "$AWS_REGION"
+              --network-configuration "awsvpcConfiguration={subnets=[$SUBNET1,$SUBNET2],assignPublicIp=ENABLED}"
           else
             aws ecs update-service \
               --cluster "$CLUSTER" \
               --service "$SERVICE" \
-              --desired-count $DESIRED_COUNT_INITIAL \
               --task-definition "$ARN" \
-              --region "$AWS_REGION"
+              --desired-count $DESIRED_COUNT_INITIAL
           fi
 
-
-      # 6. Scale service to 5 tasks
-      - name: Scale to 5 Tasks
+      - name: Scale service to 5
         run: |
           aws ecs update-service \
             --cluster "$CLUSTER" \
             --service "$SERVICE" \
-            --desired-count $DESIRED_COUNT_SCALE \
-            --region "$AWS_REGION"
+            --desired-count $DESIRED_COUNT_SCALE
 
-
-      # 7. Register scalable target (min/max settings)
       - name: Register Scalable Target
         run: |
           MAX=${ASG_MAX:-10}
@@ -93,15 +103,12 @@ jobs:
             --resource-id "service/$CLUSTER/$SERVICE" \
             --scalable-dimension ecs:service:DesiredCount \
             --min-capacity $ASG_MIN \
-            --max-capacity $MAX \
-            --region "$AWS_REGION"
+            --max-capacity $MAX
 
-
-      # 8. 🔥 FORCE RESTART ALL TASKS (like CLI)
+      # 🔥 Restart all tasks — EXACTLY like your CLI
       - name: Force Restart All Tasks
         run: |
           aws ecs update-service \
             --cluster "$CLUSTER" \
             --service "$SERVICE" \
-            --force-new-deployment \
-            --region "$AWS_REGION"
+            --force-new-deployment
