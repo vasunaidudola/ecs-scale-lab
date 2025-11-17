@@ -1,4 +1,4 @@
-name: ECS: create cluster, register taskdef, create service, scale, register scaling (no policy) & restart
+name: "ECS: create cluster, register taskdef, create service, scale, register scaling (no policy) & restart"
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ jobs:
       DESIRED_COUNT_INITIAL: 2
       DESIRED_COUNT_SCALE_TO: 5
       ASG_MIN: 5
-      ASG_MAX: ${{ secrets.MAX_CAPACITY || '10' }}
+      ASG_MAX: ${{ secrets.MAX_CAPACITY }}
       TASK_DEFINITION_FAMILY: my-nginx-task
 
     steps:
@@ -106,12 +106,13 @@ jobs:
       - name: Register scalable target (min=${ASG_MIN}, max=${ASG_MAX})
         run: |
           echo "Registering scalable target for service/${CLUSTER}/${SERVICE} ..."
+          MAX=${ASG_MAX:-10}
           aws application-autoscaling register-scalable-target \
             --service-namespace ecs \
             --resource-id "service/${CLUSTER}/${SERVICE}" \
             --scalable-dimension ecs:service:DesiredCount \
             --min-capacity ${ASG_MIN} \
-            --max-capacity ${ASG_MAX} \
+            --max-capacity ${MAX} \
             --region "${AWS_REGION}"
 
       - name: (Optional) Verify scalable target registration
