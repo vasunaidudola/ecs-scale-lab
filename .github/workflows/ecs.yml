@@ -1,4 +1,4 @@
-name: "ECS full pipeline — minimal required only"
+name: "ECS full pipeline — minimal with force-new-deployment restart"
 
 on:
   workflow_dispatch:
@@ -37,26 +37,28 @@ jobs:
           TD=$(aws ecs register-task-definition \
             --cli-input-json file://$TASKDEF_PATH \
             --query 'taskDefinition.taskDefinitionArn' \
-            --output text)
+            --output text --region "$AWS_REGION")
           echo "arn=$TD" >> $GITHUB_OUTPUT
 
       - name: Create service if missing (desiredCount=2)
         run: |
           ARN="${{ steps.reg1.outputs.arn }}"
-          SVC=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --query 'services[0].serviceArn' --output text 2>/dev/null)
-          if [ "$SVC" = "None" ] || [ "$SVC" = "" ]; then
+          SVC=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --query 'services[0].serviceArn' --output text --region "$AWS_REGION" 2>/dev/null || echo "")
+          if [ -z "$SVC" ] || [ "$SVC" = "None" ]; then
             aws ecs create-service \
               --cluster "$CLUSTER" \
               --service-name "$SERVICE" \
               --task-definition "$ARN" \
               --desired-count $DESIRED_COUNT_INITIAL \
               --launch-type FARGATE \
-              --network-configuration "awsvpcConfiguration={subnets=[$SUBNET1,$SUBNET2],assignPublicIp=ENABLED}"
+              --network-configuration "awsvpcConfiguration={subnets=[$SUBNET1,$SUBNET2],assignPublicIp=ENABLED}" \
+              --region "$AWS_REGION"
           else
             aws ecs update-service \
               --cluster "$CLUSTER" \
               --service "$SERVICE" \
-              --desired-count $DESIRED_COUNT_INITIAL
+              --desired-count $DESIRED_COUNT_INITIAL \
+              --region "$AWS_REGION"
           fi
 
       - name: Scale service to 5
@@ -64,7 +66,8 @@ jobs:
           aws ecs update-service \
             --cluster "$CLUSTER" \
             --service "$SERVICE" \
-            --desired-count $DESIRED_COUNT_SCALE
+            --desired-count $DESIRED_COUNT_SCALE \
+            --region "$AWS_REGION"
 
       - name: Register scalable target
         run: |
@@ -74,21 +77,22 @@ jobs:
             --resource-id "service/$CLUSTER/$SERVICE" \
             --scalable-dimension ecs:service:DesiredCount \
             --min-capacity $ASG_MIN \
-            --max-capacity $MAX
+            --max-capacity $MAX \
+            --region "$AWS_REGION"
 
-      - name: Register taskdef revision #2 (to force full restart)
+      - name: Register taskdef revision #2 (optional if you want a new revision)
         id: reg2
         run: |
           TD2=$(aws ecs register-task-definition \
             --cli-input-json file://$TASKDEF_PATH \
             --query 'taskDefinition.taskDefinitionArn' \
-            --output text)
+            --output text --region "$AWS_REGION")
           echo "arn=$TD2" >> $GITHUB_OUTPUT
 
-      - name: Update service to new revision (restart ALL tasks)
+      - name: Restart using force-new-deployment
         run: |
-          ARN2="${{ steps.reg2.outputs.arn }}"
           aws ecs update-service \
             --cluster "$CLUSTER" \
             --service "$SERVICE" \
-            --task-definition "$ARN2"
+            --force-new-deployment \
+            --region "$AWS_REGION"
