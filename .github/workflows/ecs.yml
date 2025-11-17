@@ -1,10 +1,10 @@
-name: "ECS: create cluster, register taskdef, create service, scale, register scaling (no policy) & restart"
+name: "ECS full pipeline — minimal required only"
 
 on:
   workflow_dispatch:
 
 jobs:
-  ecs-full-pipeline:
+  ecs:
     runs-on: ubuntu-latest
     env:
       AWS_REGION: ${{ secrets.AWS_REGION }}
@@ -13,124 +13,82 @@ jobs:
       TASKDEF_PATH: taskdef.json
       SUBNET1: ${{ secrets.SUBNET1 }}
       SUBNET2: ${{ secrets.SUBNET2 }}
-      DESIRED_COUNT_INITIAL: 2
-      DESIRED_COUNT_SCALE_TO: 5
       ASG_MIN: 5
       ASG_MAX: ${{ secrets.MAX_CAPACITY }}
-      TASK_DEFINITION_FAMILY: my-nginx-task
+      DESIRED_COUNT_INITIAL: 2
+      DESIRED_COUNT_SCALE: 5
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+      - uses: aws-actions/configure-aws-credentials@v2
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Show caller & repo head (safety)
+      - name: Create ECS cluster
         run: |
-          echo "Caller identity:"
-          aws sts get-caller-identity
-          echo "Repo root files:"
-          ls -la
-          echo "Show taskdef head:"
-          head -n 50 $TASKDEF_PATH || true
+          aws ecs create-cluster --cluster-name "$CLUSTER" --region "$AWS_REGION" || true
 
-      - name: Create ECS cluster (idempotent)
+      - name: Register taskdef revision #1
+        id: reg1
         run: |
-          echo "Creating or ensuring cluster ${CLUSTER} exists..."
-          aws ecs describe-clusters --clusters "${CLUSTER}" --region "${AWS_REGION}" || true
-          aws ecs create-cluster --cluster-name "${CLUSTER}" --region "${AWS_REGION}" || true
-          echo "Cluster ensure step finished."
+          TD=$(aws ecs register-task-definition \
+            --cli-input-json file://$TASKDEF_PATH \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "arn=$TD" >> $GITHUB_OUTPUT
 
-      - name: Register task definition from repo file
-        id: register_taskdef
+      - name: Create service if missing (desiredCount=2)
         run: |
-          echo "Registering task definition using ${TASKDEF_PATH} ..."
-          aws ecs register-task-definition --cli-input-json file://${TASKDEF_PATH} --region "${AWS_REGION}"
-          echo "Task definition registration finished."
-
-      - name: Verify task definition exists
-        run: |
-          echo "Describing registered family ${TASK_DEFINITION_FAMILY} (if exists):"
-          aws ecs describe-task-definition --task-definition "${TASK_DEFINITION_FAMILY}" --region "${AWS_REGION}" --output table || true
-
-      - name: Create service if missing (desiredCount = 2)
-        id: create_service
-        run: |
-          set -e
-          echo "Checking if service ${SERVICE} exists in cluster ${CLUSTER}..."
-          SVC_STATUS=$(aws ecs describe-services --cluster "${CLUSTER}" --services "${SERVICE}" --region "${AWS_REGION}" --query 'services[0].status' --output text 2>/dev/null || echo "NONE")
-          if [ "$SVC_STATUS" = "ACTIVE" ] || [ "$SVC_STATUS" = "DRAINING" ]; then
-            echo "Service ${SERVICE} exists (status=${SVC_STATUS}); updating desired count to ${DESIRED_COUNT_INITIAL}."
-            aws ecs update-service --cluster "${CLUSTER}" --service "${SERVICE}" --desired-count ${DESIRED_COUNT_INITIAL} --region "${AWS_REGION}"
-          else
-            echo "Service ${SERVICE} does not exist; creating with desired count ${DESIRED_COUNT_INITIAL}..."
+          ARN="${{ steps.reg1.outputs.arn }}"
+          SVC=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --query 'services[0].serviceArn' --output text 2>/dev/null)
+          if [ "$SVC" = "None" ] || [ "$SVC" = "" ]; then
             aws ecs create-service \
-              --cluster "${CLUSTER}" \
-              --service-name "${SERVICE}" \
-              --task-definition "${TASK_DEFINITION_FAMILY}" \
-              --desired-count ${DESIRED_COUNT_INITIAL} \
+              --cluster "$CLUSTER" \
+              --service-name "$SERVICE" \
+              --task-definition "$ARN" \
+              --desired-count $DESIRED_COUNT_INITIAL \
               --launch-type FARGATE \
-              --network-configuration "awsvpcConfiguration={subnets=[$SUBNET1,$SUBNET2],assignPublicIp=ENABLED}" \
-              --region "${AWS_REGION}"
-            echo "Service create command finished."
+              --network-configuration "awsvpcConfiguration={subnets=[$SUBNET1,$SUBNET2],assignPublicIp=ENABLED}"
+          else
+            aws ecs update-service \
+              --cluster "$CLUSTER" \
+              --service "$SERVICE" \
+              --desired-count $DESIRED_COUNT_INITIAL
           fi
-          echo "Current service summary:"
-          aws ecs describe-services --cluster "${CLUSTER}" --services "${SERVICE}" --region "${AWS_REGION}" --output table || true
 
-      - name: Describe tasks BEFORE scaling
+      - name: Scale service to 5
         run: |
-          echo "List tasks BEFORE scaling:"
-          aws ecs list-tasks --cluster "${CLUSTER}" --service-name "${SERVICE}" --region "${AWS_REGION}" --output text || true
+          aws ecs update-service \
+            --cluster "$CLUSTER" \
+            --service "$SERVICE" \
+            --desired-count $DESIRED_COUNT_SCALE
 
-      - name: Scale to desired count = 5
+      - name: Register scalable target
         run: |
-          echo "Updating desired count to ${DESIRED_COUNT_SCALE_TO}..."
-          aws ecs update-service --cluster "${CLUSTER}" --service "${SERVICE}" --desired-count ${DESIRED_COUNT_SCALE_TO} --region "${AWS_REGION}"
-
-      - name: Wait briefly for tasks to spin up
-        run: |
-          echo "Sleeping 20s to allow new tasks to start..."
-          sleep 20
-
-      - name: Describe tasks AFTER scaling
-        run: |
-          echo "List tasks AFTER scaling:"
-          aws ecs list-tasks --cluster "${CLUSTER}" --service-name "${SERVICE}" --region "${AWS_REGION}" --output text || true
-          aws ecs describe-services --cluster "${CLUSTER}" --services "${SERVICE}" --region "${AWS_REGION}" --output table || true
-
-      - name: Register scalable target (min=${ASG_MIN}, max=${ASG_MAX})
-        run: |
-          echo "Registering scalable target for service/${CLUSTER}/${SERVICE} ..."
           MAX=${ASG_MAX:-10}
           aws application-autoscaling register-scalable-target \
             --service-namespace ecs \
-            --resource-id "service/${CLUSTER}/${SERVICE}" \
+            --resource-id "service/$CLUSTER/$SERVICE" \
             --scalable-dimension ecs:service:DesiredCount \
-            --min-capacity ${ASG_MIN} \
-            --max-capacity ${MAX} \
-            --region "${AWS_REGION}"
+            --min-capacity $ASG_MIN \
+            --max-capacity $MAX
 
-      - name: (Optional) Verify scalable target registration
+      - name: Register taskdef revision #2 (to force full restart)
+        id: reg2
         run: |
-          echo "Describing scalable targets for verification..."
-          aws application-autoscaling describe-scalable-targets \
-            --service-namespace ecs \
-            --resource-id "service/${CLUSTER}/${SERVICE}" \
-            --scalable-dimension ecs:service:DesiredCount \
-            --region "${AWS_REGION}" --output table || true
+          TD2=$(aws ecs register-task-definition \
+            --cli-input-json file://$TASKDEF_PATH \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "arn=$TD2" >> $GITHUB_OUTPUT
 
-      - name: Restart (force new deployment) to ensure fresh tasks
+      - name: Update service to new revision (restart ALL tasks)
         run: |
-          echo "Forcing new deployment (restart) of service ${SERVICE} ..."
-          aws ecs update-service --cluster "${CLUSTER}" --service "${SERVICE}" --force-new-deployment --region "${AWS_REGION}"
-          echo "Restart triggered."
-
-      - name: Final describe & list tasks
-        run: |
-          aws ecs describe-services --cluster "${CLUSTER}" --services "${SERVICE}" --region "${AWS_REGION}" --output table || true
-          aws ecs list-tasks --cluster "${CLUSTER}" --service-name "${SERVICE}" --region "${AWS_REGION}" --output text || true
+          ARN2="${{ steps.reg2.outputs.arn }}"
+          aws ecs update-service \
+            --cluster "$CLUSTER" \
+            --service "$SERVICE" \
+            --task-definition "$ARN2"
